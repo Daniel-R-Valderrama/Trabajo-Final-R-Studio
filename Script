@@ -1,0 +1,1053 @@
+# ==============================================================================
+# Responsabilidades familiares, género y logro educativo (GEIH 2023-2025)
+# Entrega final - Taller de Programación en R 2026-2 - Grupo 2
+#
+# Qué hace este script:
+#   1. Consolida los 36 meses de la GEIH 2023-2025 (personas, ocupados, hogar
+#      y módulo K de otras formas de trabajo).
+#   2. Construye la muestra analítica única: cabezas de hogar y cónyuges de 25 a 55 años.
+#   3. Calcula estadísticas descriptivas ponderadas, gráficas y modelos.
+#   4. Exporta tablas a Word/Excel y gráficas en PNG.
+#   5. Guarda resultados agregados y lanza una Shiny App con el resumen.
+#
+# Cambios frente a la versión preliminar (ver Anexo B del documento):
+#   - Años 2023-2025 en todo el trabajo (antes texto, tablas y gráficas no coincidían).
+#   - Universo único: cabezas de hogar y cónyuges de 25 a 55 años (antes todos los ocupados).
+#   - Hijos: menores de 18 del hogar, asignados solo a cabeza de hogar y cónyuge.
+#   - Ingreso: se distingue no ocupado, ocupado con ingreso cero y sin reporte;
+#     se retira como regresor (mal control) y queda solo como robustez.
+#   - Resultado central: universitaria/posgrado. Se agrega Mujer x Hijos, edad,
+#     efectos fijos, estrato, horas de cuidado y errores agrupados por hogar.
+#   - Emparejamiento educativo medido directamente (cabeza de hogar vs. cónyuge).
+#
+# Cambios de la versión 2 (rúbrica: método avanzado visto en clase, análisis geoespacial):
+#   - Sección 8B: heterogeneidad por departamento. Se estima el modelo central en cada
+#     departamento, se prueba si la asimetría (theta2) es igual en todos, se corrige el
+#     ruido de los departamentos pequeños con bayes empírico, se mapea con sf, cortes
+#     de Jenks, ggrepel y leaflet (Clase 13) y se mide si los vecinos se parecen
+#     (I de Moran con st_touches). Una regresión entre
+#     departamentos relaciona la asimetría con características locales.
+#   - Se guarda datos_analiticos_geih.rds (lo lee el Rmd del reporte HTML).
+#   - Tablas nuevas: robustez resumida, mujeres cabeza de familia, brecha por estrato
+#     y resultados por departamento.
+# ==============================================================================
+
+rm(list = ls())
+
+# ==============================================================================
+# 1. LIBRERÍAS
+# ==============================================================================
+# install.packages(c("data.table","dplyr","tidyr","ggplot2","scales","openxlsx",
+#                    "flextable","officer","modelsummary","fixest","shiny","sf","BAMMtools","ggrepel","leaflet"))
+library(data.table)   # lectura rápida de los CSV (fread)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(openxlsx)     # Excel con todas las tablas
+library(flextable)    # tablas formateadas para Word
+library(officer)      # documento Word
+library(modelsummary) # tablas de regresión
+library(fixest)       # MPL/logit con efectos fijos y errores agrupados
+library(shiny)        # app final
+library(sf)           # datos geoespaciales (Clase 13)
+library(BAMMtools)    # getJenksBreaks(): cortes naturales de Jenks
+library(ggrepel)      # etiquetas en los mapas
+library(leaflet)      # mapa interactivo
+
+# ==============================================================================
+# 2. CONFIGURACIÓN (lo único que se debería tocar para replicar)
+# ==============================================================================
+username  <- Sys.getenv("USERNAME")
+# CUIDADO: ruta de Windows. En Mac/Linux reemplazar por la ruta propia,
+# p. ej. ruta_base <- "~/Documents/Taller2_R-main"
+ruta_base <- paste0("C:/Users/", username, "/OneDrive/Escritorio/Andes/R/Taller2_R-main")
+setwd(ruta_base)
+
+ruta_resultados <- file.path(ruta_base, "resultados_final")
+dir.create(ruta_resultados, showWarnings = FALSE)
+
+ANIOS <- c("2023", "2024", "2025")
+MESES <- c("Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto",
+           "Septiembre","Octubre","Noviembre","Diciembre")
+
+# Nombres de los archivos dentro de cada carpeta GEIH_<año>/<mes>/
+ARCH_CG  <- "Características generales, seguridad social en salud y educación.CSV"
+ARCH_OC  <- "Ocupados.CSV"
+ARCH_HOG <- "Datos del hogar y la vivienda.CSV"
+ARCH_K   <- "Otras formas de trabajo.CSV"
+
+# Población de estudio
+EDAD_MIN <- 25
+EDAD_MAX <- 55
+
+# Módulo K: código de la pregunta de HORAS SEMANALES de cuidado de niños(as)
+# sin pago. PENDIENTE: verificar el código exacto en el diccionario de la GEIH
+# (DANE, microdatos > Otras formas de trabajo) y escribirlo aquí, p. ej. "P3XXX".
+# Mientras sea NA, el script corre sin esta variable y omite el modelo M4.
+# OJO: el reporte HTML del 16-nov ya estimó M4 (horas de cuidado = 9,4 en
+# mujeres), así que alguien del grupo ya tiene el código: cópienlo aquí para que
+# el script y el reporte coincidan.
+VAR_HORAS_CUIDADO <- NA_character_
+
+# Estrato de la vivienda (módulo de hogar). Verificar el nombre en el diccionario.
+VAR_ESTRATO <- "P4030S1A1"
+
+LANZAR_APP <- TRUE   # FALSE para correr solo el análisis
+
+llaves_p <- c("DIRECTORIO", "SECUENCIA_P", "ORDEN")   # persona dentro del mes
+llaves_h <- c("DIRECTORIO", "SECUENCIA_P")            # hogar dentro del mes
+
+vars_cg  <- c(llaves_p, "DPTO", "AREA", "CLASE", "FEX_C18",
+              "P3271",   # sexo al nacer
+              "P6040",   # edad
+              "P6050",   # parentesco con el jefe
+              "P6070",   # estado civil
+              "P3042")   # mayor nivel educativo alcanzado
+vars_oc  <- c(llaves_p, "INGLABO", "P6800")           # ingreso laboral y horas
+vars_hog <- c(llaves_h, VAR_ESTRATO)
+
+# ==============================================================================
+# 3. FUNCIONES AUXILIARES
+# ==============================================================================
+# Convierte a número aceptando coma decimal (FEX_C18 viene con coma)
+a_num <- function(x) suppressWarnings(as.numeric(gsub(",", ".", as.character(x))))
+
+# Lee un módulo y conserva solo las variables pedidas que existan.
+# Devuelve NULL si el archivo no está, para que el bucle siga.
+leer_modulo <- function(ruta, vars) {
+  if (!file.exists(ruta)) return(NULL)
+  cab <- names(fread(ruta, sep = ";", nrows = 0))
+  sel <- cab[toupper(cab) %in% vars]
+  if (length(sel) == 0) return(NULL)
+  dt <- fread(ruta, sep = ";", select = sel, colClasses = "character",
+              showProgress = FALSE)
+  setnames(dt, toupper(names(dt)))
+  dt[, (names(dt)) := lapply(.SD, a_num)]
+  as_tibble(dt)
+}
+
+# Estadísticas ponderadas
+wtd_quantile <- function(x, w, probs) {
+  ok <- !is.na(x) & !is.na(w); x <- x[ok]; w <- w[ok]
+  o <- order(x); x <- x[o]; cw <- cumsum(w[o]) / sum(w)
+  sapply(probs, function(p) x[which(cw >= p)[1]])
+}
+wtd_sd <- function(x, w) {
+  ok <- !is.na(x) & !is.na(w); x <- x[ok]; w <- w[ok]
+  m <- weighted.mean(x, w); sqrt(sum(w * (x - m)^2) / sum(w))
+}
+estadisticas <- function(x, w, nombre) {
+  ok <- !is.na(x); x <- x[ok]; w <- w[ok]
+  q <- wtd_quantile(x, w, c(.25, .5, .75))
+  tibble(Variable = nombre, N = length(x),
+         Media = weighted.mean(x, w), DE = wtd_sd(x, w),
+         Min = min(x), Q1 = q[1], Mediana = q[2], Q3 = q[3], Max = max(x))
+}
+
+# Proporción ponderada con IC 95 % usando el tamaño efectivo de Kish
+resumir_prop <- function(df, y) {
+  df %>%
+    summarise(n = n(), sw = sum(peso), swy = sum(peso * {{ y }}),
+              neff = sum(peso)^2 / sum(peso^2), .groups = "drop") %>%
+    mutate(prop = swy / sw,
+           se = sqrt(prop * (1 - prop) / neff),
+           lo = prop - 1.96 * se, hi = prop + 1.96 * se)
+}
+
+# Combinación lineal de coeficientes (theta1 + theta2) con su error estándar
+lincom <- function(mod, nombres) {
+  b <- coef(mod)[nombres]; V <- vcov(mod)[nombres, nombres]
+  est <- sum(b); se <- sqrt(sum(V))
+  c(est = est, se = se, p = 2 * pnorm(-abs(est / se)))
+}
+
+tema   <- theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom", plot.title = element_text(face = "bold"),
+        plot.caption = element_text(hjust = 0))
+col_g  <- c("Hombre" = "#1f77b4", "Mujer" = "#d62728")
+fuente <- "Fuente: GEIH-DANE 2023-2025. Cabezas de hogar y cónyuges de 25 a 55 años. Cálculos propios con FEX_C18/36."
+
+# ==============================================================================
+# 4. CONSOLIDACIÓN DE LA GEIH (36 meses)
+# ==============================================================================
+t_inicio <- Sys.time()
+lista_meses <- list()
+hay_k <- !is.na(VAR_HORAS_CUIDADO)
+
+for (anio in ANIOS) {
+  for (m in seq_along(MESES)) {
+    carpeta <- file.path(paste0("GEIH_", anio), MESES[m])
+    cg <- leer_modulo(file.path(carpeta, ARCH_CG), vars_cg)
+    oc <- leer_modulo(file.path(carpeta, ARCH_OC), vars_oc)
+    if (is.null(cg) || is.null(oc)) {
+      message("No encontrado (se omite): ", anio, " ", MESES[m]); next
+    }
+
+    # Marca de pertenencia a Ocupados: permite separar "no ocupado" de
+    # "ocupado con ingreso cero" después del left_join
+    oc$en_ocupados <- 1
+    df <- cg %>% left_join(oc, by = llaves_p)
+
+    # Módulo de hogar (estrato): una fila por hogar
+    hg <- leer_modulo(file.path(carpeta, ARCH_HOG), vars_hog)
+    if (!is.null(hg) && all(llaves_h %in% names(hg)) && VAR_ESTRATO %in% names(hg)) {
+      hg <- hg %>% distinct(DIRECTORIO, SECUENCIA_P, .keep_all = TRUE) %>%
+        rename(estrato = all_of(VAR_ESTRATO))
+      df <- df %>% left_join(hg, by = llaves_h)
+    } else {
+      df$estrato <- NA_real_
+    }
+
+    # Módulo K (horas de cuidado de niños), solo si se definió el código
+    if (hay_k) {
+      k <- leer_modulo(file.path(carpeta, ARCH_K), c(llaves_p, VAR_HORAS_CUIDADO))
+      if (!is.null(k) && VAR_HORAS_CUIDADO %in% names(k)) {
+        k <- k %>% rename(horas_cuidado = all_of(VAR_HORAS_CUIDADO))
+        df <- df %>% left_join(k, by = llaves_p)
+      } else {
+        df$horas_cuidado <- NA_real_
+      }
+    }
+
+    # El periodo se arma desde el bucle para no depender de cómo venga en el CSV
+    lista_meses[[paste(anio, m)]] <- df %>%
+      mutate(ANIO = as.numeric(anio), MES = m, PERIODO = ANIO * 100 + MES)
+  }
+}
+base_geih <- bind_rows(lista_meses)
+rm(lista_meses, cg, oc, hg, df)
+cat("Tiempo de carga (min):", round(difftime(Sys.time(), t_inicio, units = "mins"), 1), "\n")
+
+# Peso: al juntar varios meses, FEX_C18 se divide entre el número de periodos,
+# así los totales ponderados representan la población promedio del periodo
+n_periodos <- n_distinct(base_geih$PERIODO)
+base_geih <- base_geih %>% mutate(peso = FEX_C18 / n_periodos)
+if (!"horas_cuidado" %in% names(base_geih)) base_geih$horas_cuidado <- NA_real_
+
+# ==============================================================================
+# 5. CONSTRUCCIÓN DE VARIABLES
+# ==============================================================================
+# 5.1 Variables a nivel de hogar. El hogar se identifica por PERIODO + DIRECTORIO
+# + SECUENCIA_P: sin PERIODO se mezclarían hogares de meses distintos.
+# Hijos = hijos(as) o hijastros(as) de la cabeza de hogar (P6050 = 3) que viven en el hogar.
+hogares <- base_geih %>%
+  group_by(PERIODO, DIRECTORIO, SECUENCIA_P) %>%
+  summarise(n_hijos_total = sum(P6050 == 3, na.rm = TRUE),
+            n_hijos_18    = sum(P6050 == 3 & P6040 < 18, na.rm = TRUE),
+            n_hijos_5     = sum(P6050 == 3 & P6040 < 5,  na.rm = TRUE),
+            hay_conyuge   = any(P6050 == 2, na.rm = TRUE),
+            .groups = "drop")
+
+niv_ec <- c("Soltero(a)", "Unión libre", "Casado(a)", "Separado(a)/Viudo(a)")
+niv_estrato <- c("Bajo (1-2)", "Medio (3)", "Alto (4-6)", "Sin dato")
+
+base <- base_geih %>%
+  left_join(hogares, by = c("PERIODO", "DIRECTORIO", "SECUENCIA_P")) %>%
+  mutate(
+    id_hogar = paste(PERIODO, DIRECTORIO, SECUENCIA_P, sep = "_"),
+    mujer    = as.numeric(P3271 == 2),
+    sexo     = factor(ifelse(P3271 == 2, "Mujer", "Hombre"), levels = c("Hombre", "Mujer")),
+    edad     = P6040,
+    edad_grp = cut(edad, c(24, 34, 44, 55), labels = c("25-34", "35-44", "45-55")),
+    # Resultado central: universitaria, especialización, maestría o doctorado
+    univ     = as.numeric(P3042 %in% 10:13),
+    nivel    = factor(case_when(P3042 %in% 1:3  ~ "Primaria o menos",
+                                P3042 %in% 4:7  ~ "Secundaria/Media",
+                                P3042 %in% 8:9  ~ "Técnica/Tecnológica",
+                                P3042 %in% 10:13 ~ "Universitaria/Posgrado"),
+                      levels = c("Primaria o menos", "Secundaria/Media",
+                                 "Técnica/Tecnológica", "Universitaria/Posgrado")),
+    # Condición conyugal agrupada (base: soltero)
+    ec = factor(case_when(P6070 == 6      ~ niv_ec[1],
+                          P6070 %in% 1:2  ~ niv_ec[2],
+                          P6070 == 3      ~ niv_ec[3],
+                          P6070 %in% 4:5  ~ niv_ec[4]), levels = niv_ec),
+    hijos_cat = factor(pmin(n_hijos_18, 3), levels = 0:3, labels = c("0", "1", "2", "3+")),
+    # Mujer cabeza de hogar sin cónyuge con al menos un hijo menor
+    jefa_monoparental = as.numeric(P6050 == 1 & mujer == 1 & !hay_conyuge & n_hijos_18 >= 1),
+    # Ingreso: tres casos que antes se confundían
+    ocupado = as.numeric(!is.na(en_ocupados)),
+    caso_ingreso = case_when(ocupado == 0     ~ "No ocupado",
+                             is.na(INGLABO)   ~ "Ocupado sin reporte",
+                             INGLABO == 0     ~ "Ocupado con ingreso cero",
+                             TRUE             ~ "Ocupado con ingreso positivo"),
+    ingreso_millones = ifelse(ocupado == 1, INGLABO / 1e6, NA),
+    horas_trabajo    = ifelse(ocupado == 1, P6800, NA),
+    # Estrato: "Sin dato" se conserva como categoría para no perder rural disperso
+    estrato_grp = factor(case_when(estrato %in% 1:2 ~ niv_estrato[1],
+                                   estrato == 3     ~ niv_estrato[2],
+                                   estrato %in% 4:6 ~ niv_estrato[3],
+                                   TRUE             ~ niv_estrato[4]), levels = niv_estrato),
+    estrato_bajo = case_when(estrato %in% 1:2 ~ 1, estrato %in% 3:6 ~ 0, TRUE ~ NA_real_)
+  )
+
+# 5.2 Educación del cónyuge: se empareja a la cabeza de hogar con el cónyuge del mismo hogar.
+# Esto reemplaza la inferencia de la primera entrega basada en proporciones.
+pareja <- base %>%
+  filter(P6050 %in% 1:2) %>%
+  distinct(PERIODO, DIRECTORIO, SECUENCIA_P, P6050, .keep_all = TRUE) %>%
+  transmute(PERIODO, DIRECTORIO, SECUENCIA_P, rol = P6050,
+            univ_pareja = ifelse(P3042 %in% 1:13, univ, NA), mujer_pareja = mujer)
+
+base <- base %>%
+  mutate(rol_pareja = case_when(P6050 == 1 ~ 2, P6050 == 2 ~ 1)) %>%
+  left_join(pareja, by = c("PERIODO", "DIRECTORIO", "SECUENCIA_P", "rol_pareja" = "rol"))
+
+
+# ==============================================================================
+# 6. MUESTRA ANALÍTICA ÚNICA (descriptivos y modelos usan la misma)
+# ==============================================================================
+f0 <- base
+f1 <- f0 %>% filter(P6050 %in% 1:2)                    # padres de los hijos del hogar
+f2 <- f1 %>% filter(edad >= EDAD_MIN, edad <= EDAD_MAX) # edad de estudios terminados y crianza
+f3 <- f2 %>% filter(P3271 %in% 1:2)
+f4 <- f3 %>% filter(!is.na(ec))
+d  <- f4 %>% filter(P3042 %in% 1:13)                   # excluye 99 = no sabe
+
+tabla_depuracion <- tibble(
+  Paso = c("Personas en la GEIH 2023-2025",
+           "Cabezas de hogar y cónyuges",
+           paste0("Entre ", EDAD_MIN, " y ", EDAD_MAX, " años"),
+           "Con sexo válido",
+           "Con estado civil válido",
+           "Con nivel educativo válido (muestra final)"),
+  N = c(nrow(f0), nrow(f1), nrow(f2), nrow(f3), nrow(f4), nrow(d))
+) %>% mutate(`% del total` = 100 * N / first(N))
+rm(f0, f1, f2, f3, f4)
+
+cat("Muestra final:", nrow(d), "personas; población representada (millones):",
+    round(sum(d$peso) / 1e6, 2), "\n")
+
+# ==============================================================================
+# 7. ESTADÍSTICAS DESCRIPTIVAS
+# ==============================================================================
+# 7.1 Observaciones por año y mes (base completa) -> Anexo A
+obs_anio_mes <- base_geih %>% count(ANIO, MES) %>%
+  pivot_wider(names_from = ANIO, values_from = n) %>% arrange(MES) %>%
+  mutate(Mes = MESES[MES]) %>% select(-MES) %>% relocate(Mes)
+obs_anio_mes <- bind_rows(obs_anio_mes,
+                          obs_anio_mes %>% summarise(across(-Mes, ~ sum(.x, na.rm = TRUE))) %>%
+                            mutate(Mes = "Total")) %>%
+  mutate(Total = rowSums(across(-Mes), na.rm = TRUE))
+
+# 7.2 Tabla 1: medias ponderadas por sexo
+wm <- function(x, w) { ok <- !is.na(x); if (!any(ok)) NA_real_ else weighted.mean(x[ok], w[ok]) }
+t1_largo <- d %>%
+  group_by(sexo) %>%
+  summarise(
+    `Universitaria o posgrado (%)`               = 100 * wm(univ, peso),
+    `Edad (años)`                                = wm(edad, peso),
+    `Hijos menores de 18 en el hogar`            = wm(n_hijos_18, peso),
+    `Hijos menores de 5 en el hogar`             = wm(n_hijos_5, peso),
+    `Casado(a) o en unión libre (%)`             = 100 * wm(ec %in% niv_ec[2:3], peso),
+    `Cabeza de hogar sin cónyuge con hijos menores (%)`  = 100 * wm(P6050 == 1 & !hay_conyuge & n_hijos_18 >= 1, peso),
+    `Ocupado(a) (%)`                             = 100 * wm(ocupado, peso),
+    `Horas trabajadas por semana (ocupados)`     = wm(horas_trabajo, peso),
+    `Ingreso laboral (millones COP, ingreso > 0)` = wm(ifelse(ingreso_millones > 0, ingreso_millones, NA), peso),
+    `Horas semanales de cuidado de niños`        = wm(horas_cuidado, peso),
+    `Estrato 1-2 (%)`                            = 100 * wm(estrato_grp == niv_estrato[1], peso),
+    `Observaciones (sin ponderar)`               = n(),
+    .groups = "drop") %>%
+  pivot_longer(-sexo, names_to = "Variable") %>%
+  pivot_wider(names_from = sexo, values_from = value)
+tabla_1 <- t1_largo %>%
+  transmute(Variable, Mujeres = Mujer, Hombres = Hombre,
+            `Diferencia (M - H)` = ifelse(Variable == "Observaciones (sin ponderar)", NA, Mujer - Hombre))
+
+# 7.3 Continuas con dispersión, por sexo -> Anexo A
+tabla_continuas <- bind_rows(lapply(levels(d$sexo), function(s) {
+  ds <- d %>% filter(sexo == s)
+  bind_rows(
+    estadisticas(ds$edad, ds$peso, "Edad"),
+    estadisticas(ds$n_hijos_18, ds$peso, "Hijos menores de 18"),
+    estadisticas(ds$horas_trabajo, ds$peso, "Horas trabajadas (ocupados)"),
+    estadisticas(ifelse(ds$ingreso_millones > 0, ds$ingreso_millones, NA), ds$peso,
+                 "Ingreso laboral (millones COP, > 0)"),
+    if (hay_k) estadisticas(ds$horas_cuidado, ds$peso, "Horas de cuidado de niños")
+  ) %>% mutate(Sexo = s, .before = 1)
+}))
+
+# 7.4 Casos de ingreso -> Anexo A (Tabla A6)
+tabla_ingreso <- d %>% group_by(Sexo = sexo, Caso = caso_ingreso) %>%
+  summarise(N = n(), pob = sum(peso), .groups = "drop_last") %>%
+  mutate(`% población` = 100 * pob / sum(pob)) %>% select(-pob) %>% ungroup()
+
+# 7.5 Emparejamiento educativo (personas con cónyuge del otro sexo en el hogar)
+emp <- d %>% filter(!is.na(univ_pareja), mujer_pareja != mujer)
+tabla_emparejamiento <- emp %>%
+  group_by(Sexo = sexo, `Es universitario(a)` = ifelse(univ == 1, "Sí", "No")) %>%
+  summarise(N = n(), `% con pareja universitaria` = 100 * weighted.mean(univ_pareja, peso),
+            .groups = "drop")
+# Referencia de emparejamiento aleatorio: % de parejas universitarias en general
+ref_aleatoria <- emp %>% group_by(Sexo = sexo) %>%
+  summarise(`% pareja universitaria (aleatorio)` = 100 * weighted.mean(univ_pareja, peso), .groups = "drop")
+tabla_emparejamiento <- tabla_emparejamiento %>% left_join(ref_aleatoria, by = "Sexo")
+
+print(tabla_depuracion); print(tabla_1, n = Inf); print(tabla_emparejamiento)
+
+# ==============================================================================
+# 8. MODELOS
+# ==============================================================================
+# Ecuación central (M2):
+# Univ = b0 + b1 Mujer + sum g_k EC_k + sum d_k Mujer*EC_k + t1 Hijos + t2 Mujer*Hijos
+#        + edad + edad^2 + FE(año) + FE(departamento) + FE(zona) + e
+# t1 = asociación de un hijo con el logro de los hombres; t1 + t2 = de las mujeres.
+# Errores agrupados por hogar (cabeza de hogar y cónyuge comparten choques).
+d <- d %>% mutate(edad2 = edad^2)
+
+m1 <- feols(univ ~ mujer * ec + mujer * n_hijos_18,
+            data = d, cluster = ~ id_hogar)
+m2 <- feols(univ ~ mujer * ec + mujer * n_hijos_18 + edad + edad2 | ANIO + DPTO + CLASE,
+            data = d, cluster = ~ id_hogar)
+m3 <- feols(univ ~ mujer * ec + mujer * n_hijos_18 + edad + edad2 + estrato_grp | ANIO + DPTO + CLASE,
+            data = d, cluster = ~ id_hogar)
+modelos <- list("M1" = m1, "M2 (central)" = m2, "M3" = m3)
+if (hay_k && any(!is.na(d$horas_cuidado))) {
+  m4 <- feols(univ ~ mujer * ec + mujer * n_hijos_18 + edad + edad2 + estrato_grp + horas_cuidado |
+                ANIO + DPTO + CLASE, data = d, cluster = ~ id_hogar)
+  modelos[["M4"]] <- m4
+}
+
+# Efecto de los hijos en mujeres (theta1 + theta2) para cada modelo
+efecto_mujeres <- bind_rows(lapply(names(modelos), function(nm) {
+  r <- lincom(modelos[[nm]], c("n_hijos_18", "mujer:n_hijos_18"))
+  tibble(Modelo = nm,
+         `theta1 (hombres)` = coef(modelos[[nm]])["n_hijos_18"],
+         `theta2 (Mujer x Hijos)` = coef(modelos[[nm]])["mujer:n_hijos_18"],
+         `theta1 + theta2 (mujeres)` = r["est"], `EE` = r["se"], `p-valor` = r["p"])
+}))
+print(efecto_mujeres)
+
+# Heterogeneidad: interacción triple con estrato bajo (solo hogares con estrato)
+m_het <- feols(univ ~ mujer * ec + mujer * n_hijos_18 * estrato_bajo + edad + edad2 |
+                 ANIO + DPTO + CLASE, data = d %>% filter(!is.na(estrato_bajo)),
+               cluster = ~ id_hogar)
+
+# Pendiente de los hijos por sexo y estrato (insumo de la Gráfica 4)
+grupos <- d %>% filter(estrato_grp != "Sin dato") %>% distinct(sexo, estrato_grp)
+pendientes <- bind_rows(lapply(seq_len(nrow(grupos)), function(i) {
+  dg <- d %>% filter(sexo == grupos$sexo[i], estrato_grp == grupos$estrato_grp[i])
+  mg <- feols(univ ~ n_hijos_18 + ec + edad + edad2 | ANIO + DPTO + CLASE,
+              data = dg, cluster = ~ id_hogar)
+  ct <- coeftable(mg)["n_hijos_18", ]
+  tibble(sexo = grupos$sexo[i], estrato_grp = grupos$estrato_grp[i],
+         est = ct[1], se = ct[2], n = nobs(mg))
+})) %>% mutate(lo = est - 1.96 * se, hi = est + 1.96 * se)
+
+# Robustez
+m2_pond <- feols(univ ~ mujer * ec + mujer * n_hijos_18 + edad + edad2 | ANIO + DPTO + CLASE,
+                 data = d, weights = ~ peso, cluster = ~ id_hogar)
+# Especificación de la primera entrega (con ingreso y solo ocupados) para comparar
+m_ingreso <- feols(univ ~ mujer * ec + mujer * n_hijos_18 + ingreso_millones + edad + edad2 |
+                     ANIO + DPTO + CLASE, data = d %>% filter(!is.na(ingreso_millones)),
+                   cluster = ~ id_hogar)
+m2_logit <- feglm(univ ~ mujer * ec + mujer * n_hijos_18 + edad + edad2 | ANIO + DPTO + CLASE,
+                  data = d, family = "logit", cluster = ~ id_hogar)
+
+# Efecto marginal promedio de un hijo adicional en el logit, por sexo
+# (diferencia de probabilidades predichas al sumar un hijo)
+ame_hijos <- function(mod, datos, s) {
+  dd <- datos %>% filter(mujer == s)
+  p0 <- predict(mod, newdata = dd, type = "response")
+  dd$n_hijos_18 <- dd$n_hijos_18 + 1
+  p1 <- predict(mod, newdata = dd, type = "response")
+  mean(p1 - p0, na.rm = TRUE)
+}
+tabla_ame <- tibble(Sexo = c("Hombre", "Mujer"),
+                    `AME logit de un hijo adicional` = c(ame_hijos(m2_logit, d, 0),
+                                                         ame_hijos(m2_logit, d, 1)))
+print(tabla_ame)
+
+# Resumen de robustez: los mismos parámetros en cada especificación (Tabla A5)
+fila_rob <- function(mod, nombre) {
+  b <- coef(mod); r <- lincom(mod, c("n_hijos_18", "mujer:n_hijos_18"))
+  tibble(Especificación = nombre, N = nobs(mod), Mujer = unname(b["mujer"]),
+         `theta1 (hombres)` = unname(b["n_hijos_18"]),
+         `theta2 (Mujer x Hijos)` = unname(b["mujer:n_hijos_18"]),
+         `theta1 + theta2 (mujeres)` = unname(r["est"]))
+}
+tabla_robustez <- bind_rows(fila_rob(m2, "M2 (central)"),
+                            fila_rob(m2_pond, "M2 ponderado con FEX_C18"),
+                            fila_rob(m_ingreso, "Con ingreso, solo ocupados (1.a entrega)"))
+print(tabla_robustez)
+
+# Mujeres cabeza de familia frente a madres en pareja, con el mismo número de hijos
+tabla_jefas <- d %>%
+  filter(mujer == 1, n_hijos_18 >= 1, jefa_monoparental == 1 | hay_conyuge) %>%
+  mutate(Grupo = ifelse(jefa_monoparental == 1, "Jefa sin cónyuge", "Madre en pareja")) %>%
+  group_by(`Hijos menores de 18` = hijos_cat, Grupo) %>%
+  summarise(N = n(), `% universitaria` = 100 * weighted.mean(univ, peso), .groups = "drop") %>%
+  pivot_wider(names_from = Grupo, values_from = c(N, `% universitaria`))
+print(tabla_jefas)
+
+# Brecha por estrato (insumo del texto de la Gráfica 4): pendiente mujeres - hombres
+brecha_estrato <- pendientes %>%
+  select(sexo, estrato_grp, est) %>%
+  pivot_wider(names_from = sexo, values_from = est) %>%
+  mutate(`Brecha (M - H), p.p.` = 100 * (Mujer - Hombre))
+print(brecha_estrato)
+
+# ==============================================================================
+# 8B. HETEROGENEIDAD GEOGRÁFICA POR DEPARTAMENTO (Clase 13: datos geoespaciales)
+# ==============================================================================
+# Pregunta: ¿la asimetría entre mujeres y hombres (theta2) es igual en todo el
+# país o está diferenciada localmente?
+#   (a) MPL central (M2) dentro de cada departamento: theta1, theta2, theta1 + theta2
+#   (b) Prueba formal (Wald) de que theta2 es igual en todos los departamentos
+#   (c) Bayes empírico: las estimaciones de los departamentos pequeños son ruidosas;
+#       se acercan a la media nacional según su precisión (DerSimonian y Laird)
+#   (d) Mapas: shapefile con sf, unión por atributo (sf a la izquierda), coropletas
+#       con cortes de Jenks, etiquetas con ggrepel y mapa interactivo con leaflet
+#   (e) ¿Los vecinos se parecen? Vecindad con st_touches() e I de Moran por permutación
+#   (f) Regresión entre departamentos: asimetría vs. características locales
+# CUIDADO: en Arauca, Casanare, Putumayo, Amazonas, Guainía, Guaviare, Vaupés y
+# Vichada la GEIH solo encuesta la capital; en San Andrés, solo la isla.
+
+nombres_dpto <- c("05" = "Antioquia", "08" = "Atlántico", "11" = "Bogotá D.C.", "13" = "Bolívar",
+                  "15" = "Boyacá", "17" = "Caldas", "18" = "Caquetá", "19" = "Cauca", "20" = "Cesar",
+                  "23" = "Córdoba", "25" = "Cundinamarca", "27" = "Chocó", "41" = "Huila",
+                  "44" = "La Guajira", "47" = "Magdalena", "50" = "Meta", "52" = "Nariño",
+                  "54" = "Norte de Santander", "63" = "Quindío", "66" = "Risaralda", "68" = "Santander",
+                  "70" = "Sucre", "73" = "Tolima", "76" = "Valle del Cauca", "81" = "Arauca",
+                  "85" = "Casanare", "86" = "Putumayo", "88" = "San Andrés", "91" = "Amazonas",
+                  "94" = "Guainía", "95" = "Guaviare", "97" = "Vaupés", "99" = "Vichada")
+dptos_solo_capital <- c("81", "85", "86", "91", "94", "95", "97", "99")
+
+d <- d %>% mutate(cod_dpto = sprintf("%02d", as.integer(DPTO)), mujer_hijos = mujer * n_hijos_18)
+
+# (a) Modelo central dentro de cada departamento (sin EF de departamento: es constante)
+res_dpto <- bind_rows(lapply(sort(unique(d$cod_dpto)), function(cd) {
+  dd <- d %>% filter(cod_dpto == cd)
+  m  <- tryCatch(feols(univ ~ mujer * ec + mujer * n_hijos_18 + edad + edad2 | ANIO + CLASE,
+                       data = dd, cluster = ~ id_hogar), error = function(e) NULL)
+  if (is.null(m)) { message("Sin estimación para el departamento ", cd); return(NULL) }
+  ct <- coeftable(m); r <- lincom(m, c("n_hijos_18", "mujer:n_hijos_18"))
+  tibble(cod_dpto = cd, n = nobs(m),
+         hombres = ct["n_hijos_18", 1],       se_hombres = ct["n_hijos_18", 2],
+         theta2  = ct["mujer:n_hijos_18", 1], se_theta2  = ct["mujer:n_hijos_18", 2],
+         mujeres = r[["est"]],                se_mujeres = r[["se"]])
+}))
+
+# (b) ¿theta2 es igual en todos los departamentos? Modelo conjunto con una
+# pendiente por departamento (base: Bogotá) y prueba de Wald de que todas las
+# desviaciones son cero. EF de departamento x sexo y errores agrupados por hogar.
+m_geo <- feols(univ ~ mujer * ec + edad + edad2 + n_hijos_18 + mujer_hijos +
+                 i(cod_dpto, n_hijos_18, ref = "11") + i(cod_dpto, mujer_hijos, ref = "11") |
+                 ANIO + cod_dpto^mujer + CLASE, data = d, cluster = ~ id_hogar)
+w_geo <- wald(m_geo, keep = "^cod_dpto::.*:mujer_hijos$", print = FALSE)
+
+# (c) Bayes empírico (DerSimonian y Laird): tau2 = varianza de la asimetría
+# "verdadera" entre departamentos; lambda = peso de la estimación propia
+eb_shrink <- function(est, se) {
+  w <- 1 / se^2; mu <- sum(w * est) / sum(w); k <- length(est)
+  Q <- sum(w * (est - mu)^2)
+  tau2 <- max(0, (Q - (k - 1)) / (sum(w) - sum(w^2) / sum(w)))
+  lambda <- tau2 / (tau2 + se^2)
+  list(eb = mu + lambda * (est - mu), lambda = lambda, mu = mu, tau2 = tau2, Q = Q)
+}
+eb_t2 <- eb_shrink(res_dpto$theta2, res_dpto$se_theta2)
+eb_mu <- eb_shrink(res_dpto$mujeres, res_dpto$se_mujeres)
+res_dpto <- res_dpto %>%
+  mutate(nombre = unname(nombres_dpto[cod_dpto]),
+         solo_capital = cod_dpto %in% dptos_solo_capital,
+         theta2_eb = eb_t2$eb, lambda = eb_t2$lambda, mujeres_eb = eb_mu$eb,
+         asim_eb = -theta2_eb,                      # asimetría: caída adicional en mujeres
+         asim_pp = 100 * asim_eb, caida_mujeres_pp = -100 * mujeres_eb,
+         lo = theta2 - 1.96 * se_theta2, hi = theta2 + 1.96 * se_theta2)
+
+# G5. Asimetría por departamento: estimación propia (IC 95 %) y bayes empírico.
+# No necesita shapefile, así que siempre se produce.
+grafico_5 <- ggplot(res_dpto, aes(y = reorder(nombre, -theta2_eb))) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = eb_t2$mu, color = "#d62728", alpha = 0.5) +
+  geom_errorbar(aes(xmin = lo, xmax = hi), width = 0, orientation = "y", color = "gray60") +
+  geom_point(aes(x = theta2), color = "gray40", size = 2) +
+  geom_point(aes(x = theta2_eb), color = "#d62728", size = 2.6) +
+  scale_x_continuous(labels = function(x) paste0(round(100 * x, 1), " p.p.")) +
+  labs(title = "Gráfica 5. Asimetría de los hijos por departamento (Mujer × Hijos, θ₂)",
+       subtitle = "Gris: estimación del departamento con IC 95 %. Rojo: bayes empírico. Línea roja: media nacional",
+       x = "θ₂: caída adicional por hijo en mujeres frente a hombres (p.p.)", y = NULL, caption = fuente) + tema
+ggsave(file.path(ruta_resultados, "G5_asimetria_departamentos.png"), grafico_5,
+       width = 8, height = 9, dpi = 300, bg = "white")
+
+# (d) MAPAS. Shapefile de departamentos del Marco Geoestadístico Nacional (DANE):
+# geoportal.dane.gov.co > Descargas > MGN > nivel departamento. Como en la Clase 13,
+# st_read() recibe la CARPETA con los archivos .shp, .dbf, .shx y .prj.
+# Verificar el nombre del campo con el código DIVIPOLA (en el MGN suele ser DPTO_CCDGO).
+RUTA_SHP  <- file.path(ruta_base, "MGN_DPTO_POLITICO")
+CAMPO_SHP <- "DPTO_CCDGO"
+hay_shp   <- dir.exists(RUTA_SHP)
+col_lisa  <- c("Alta asimetría, vecinos altos" = "#b2182b", "Baja asimetría, vecinos bajos" = "#2166ac",
+               "Alta asimetría, vecinos bajos" = "#f4a582", "Baja asimetría, vecinos altos" = "#92c5de",
+               "Sin vecinos" = "gray80")
+
+if (hay_shp) {
+  dptos_sf <- st_read(RUTA_SHP, quiet = TRUE) %>%
+    rename(cod_dpto = all_of(CAMPO_SHP)) %>%
+    mutate(cod_dpto = sprintf("%02d", as.integer(cod_dpto))) %>%
+    select(cod_dpto) %>%
+    st_make_valid() %>%
+    st_transform(9377)               # MAGNA-SIRGAS Origen Nacional, en metros
+  st_crs(dptos_sf)$units_gdal        # debe decir metre
+
+  # Unión por atributo: el sf va a la IZQUIERDA para conservar la geometría
+  mapa_dpto <- dptos_sf %>% left_join(res_dpto, by = "cod_dpto")
+  sum(is.na(mapa_dpto$theta2))       # departamentos sin estimación
+
+  # (e) Vecindad con st_touches() sobre la geometría completa (antes de simplificar)
+  # e I de Moran: correlación entre la asimetría de cada departamento y el promedio
+  # de sus vecinos. p-valor por permutación: se reparte la asimetría al azar 999 veces.
+  geo_ok <- mapa_dpto %>% filter(!is.na(asim_eb))
+  vecinos <- st_touches(geo_ok)
+  W <- matrix(0, nrow(geo_ok), nrow(geo_ok))
+  for (i in seq_len(nrow(geo_ok))) W[i, vecinos[[i]]] <- 1
+  W <- W / pmax(rowSums(W), 1)       # promedio de los vecinos; San Andrés no tiene
+  moran_I <- function(x, W) {
+    z <- x - mean(x); (length(z) / sum(W)) * sum(W * outer(z, z)) / sum(z^2)
+  }
+  x_asim <- geo_ok$theta2 * -100     # estimación propia, sin bayes empírico
+  I_obs  <- moran_I(x_asim, W)
+  set.seed(2026)
+  I_perm <- replicate(999, moran_I(sample(x_asim), W))
+  p_moran <- (sum(I_perm >= I_obs) + 1) / (999 + 1)
+  z_asim <- x_asim - mean(x_asim); lag_asim <- as.vector(W %*% z_asim)
+  geo_ok <- geo_ok %>%
+    mutate(lisa = factor(case_when(rowSums(W) == 0          ~ "Sin vecinos",
+                                   z_asim > 0 & lag_asim > 0 ~ "Alta asimetría, vecinos altos",
+                                   z_asim < 0 & lag_asim < 0 ~ "Baja asimetría, vecinos bajos",
+                                   z_asim > 0                ~ "Alta asimetría, vecinos bajos",
+                                   TRUE                      ~ "Baja asimetría, vecinos altos"),
+                         levels = names(col_lisa)))
+  res_dpto <- res_dpto %>% left_join(st_drop_geometry(geo_ok) %>% select(cod_dpto, lisa), by = "cod_dpto")
+
+  # Geometría simplificada solo para dibujar (más liviana). San Andrés no se dibuja
+  # para que el mapa no quede diminuto; su resultado está en la Tabla A9.
+  mapa_plot <- geo_ok %>% st_simplify(dTolerance = 500) %>% filter(cod_dpto != "88")
+
+  # Función de mapas con cortes de Jenks (la de la Clase 13, con un respaldo por
+  # cuantiles si hay menos de seis valores distintos)
+  mapa_jenks <- function(datos, variable, titulo_leyenda, paleta) {
+    x <- datos[[variable]]
+    cortes <- tryCatch(unique(getJenksBreaks(x, 6)), error = function(e) NULL)
+    if (length(cortes) < 3) cortes <- unique(quantile(x, 0:4 / 4))
+    datos$clase <- cut(x, breaks = cortes, include.lowest = TRUE, dig.lab = 3)
+    ggplot(datos) +
+      geom_sf(aes(fill = clase), color = "white", linewidth = 0.1) +
+      scale_fill_brewer(palette = paleta, name = titulo_leyenda) +
+      theme_void() +
+      theme(legend.position = "bottom", plot.title = element_text(face = "bold"),
+            plot.caption = element_text(hjust = 0))
+  }
+  nota_mapa <- paste(fuente, "\nLínea punteada: departamentos donde la GEIH solo cubre la capital. San Andrés no se dibuja (ver Tabla A9).")
+  top5 <- mapa_plot %>% arrange(desc(asim_pp)) %>% head(5)
+
+  # G6. Mapa de la asimetría (bayes empírico), con los 5 departamentos más altos
+  grafico_6 <- mapa_jenks(mapa_plot, "asim_pp", "Caída adicional por hijo en mujeres (p.p.)", "YlOrRd") +
+    geom_sf(data = filter(mapa_plot, solo_capital), fill = NA, color = "gray25",
+            linetype = "dashed", linewidth = 0.4) +
+    geom_text_repel(data = top5, aes(label = nombre, geometry = geometry),
+                    stat = "sf_coordinates", size = 3, min.segment.length = 0) +
+    labs(title = "Gráfica 6. Asimetría de los hijos en el logro universitario, por departamento",
+         subtitle = "−θ₂ con bayes empírico; clases por cortes naturales (Jenks)", caption = nota_mapa)
+
+  # G7. ¿Se agrupa en el territorio? Cuadrantes del diagrama de Moran
+  grafico_7 <- ggplot(mapa_plot) +
+    geom_sf(aes(fill = lisa), color = "white", linewidth = 0.1) +
+    scale_fill_manual(values = col_lisa, drop = FALSE, name = NULL) +
+    labs(title = "Gráfica 7. Asimetría de cada departamento frente a la de sus vecinos",
+         subtitle = paste0("I de Moran = ", round(I_obs, 3), " (p por permutación = ", round(p_moran, 3), ")"),
+         caption = nota_mapa) +
+    theme_void() + theme(legend.position = "bottom", plot.title = element_text(face = "bold"),
+                         plot.caption = element_text(hjust = 0)) +
+    guides(fill = guide_legend(nrow = 2))
+
+  ggsave(file.path(ruta_resultados, "G6_mapa_asimetria.png"), grafico_6, width = 8, height = 9, dpi = 300, bg = "white")
+  ggsave(file.path(ruta_resultados, "G7_mapa_vecinos.png"), grafico_7, width = 8, height = 9, dpi = 300, bg = "white")
+
+  # Mapa interactivo (leaflet SOLO entiende WGS84 = 4326)
+  mapa_wgs <- st_transform(mapa_plot, 4326)
+  cortes_l <- tryCatch(unique(getJenksBreaks(mapa_wgs$asim_pp, 6)), error = function(e) NULL)
+  if (length(cortes_l) < 3) cortes_l <- unique(quantile(mapa_wgs$asim_pp, 0:4 / 4))
+  paleta <- colorBin("YlOrRd", domain = mapa_wgs$asim_pp, bins = cortes_l)
+  paleta_m <- colorNumeric("Blues", domain = mapa_wgs$caida_mujeres_pp)
+  mapa_leaflet <- leaflet() %>%
+    addProviderTiles(providers$Esri.WorldStreetMap) %>%
+    addPolygons(data = mapa_wgs, fillColor = ~paleta(asim_pp), fillOpacity = 0.75,
+                color = "white", weight = 1, label = ~nombre,
+                popup = ~paste0("<b>", nombre, "</b><br>",
+                                "Asimetría (bayes empírico): ", round(asim_pp, 2), " p.p.<br>",
+                                "θ₂ propio: ", round(100 * theta2, 2), " (EE ", round(100 * se_theta2, 2), ")<br>",
+                                "Caída por hijo en mujeres: ", round(caida_mujeres_pp, 2), " p.p.<br>",
+                                "Observaciones: ", format(n, big.mark = "."),
+                                ifelse(solo_capital, "<br><i>Solo la capital</i>", "")),
+                highlightOptions = highlightOptions(weight = 3, color = "black", bringToFront = TRUE),
+                group = "Asimetría (−θ₂)") %>%
+    addPolygons(data = mapa_wgs, fillColor = ~paleta_m(caida_mujeres_pp), fillOpacity = 0.75,
+                color = "white", weight = 1, label = ~nombre, group = "Caída por hijo en mujeres") %>%
+    addLegend(pal = paleta, values = mapa_wgs$asim_pp, title = "Asimetría (p.p.)", position = "bottomright") %>%
+    addLayersControl(baseGroups = c("Asimetría (−θ₂)", "Caída por hijo en mujeres"),
+                     options = layersControlOptions(collapsed = FALSE))
+  htmlwidgets::saveWidget(mapa_leaflet, file.path(ruta_resultados, "mapa_asimetria_departamentos.html"),
+                          selfcontained = TRUE)
+
+  # Versión liviana para la Shiny App
+  mapa_app <- mapa_wgs %>% select(nombre, asim_eb, mujeres_eb, lisa)
+} else {
+  message("No se encontró el shapefile en ", RUTA_SHP, ": se omiten mapas y prueba de Moran.")
+  I_obs <- NA_real_; p_moran <- NA_real_
+  res_dpto$lisa <- NA
+}
+
+# (f) Regresión entre departamentos: ¿con qué características locales se asocia
+# la asimetría? Variables construidas con la misma GEIH (medias ponderadas).
+# Se pondera por la precisión de cada estimación (1 / EE²), errores robustos.
+caract_dpto <- d %>%
+  group_by(cod_dpto) %>%
+  summarise(ocup_fem         = 100 * wm(ocupado[mujer == 1], peso[mujer == 1]),
+            univ_fem         = 100 * wm(univ[mujer == 1], peso[mujer == 1]),
+            pct_cabecera     = 100 * wm(as.numeric(CLASE == 1), peso),
+            pct_estrato_bajo = 100 * wm(as.numeric(estrato_grp == "Bajo (1-2)"), peso),
+            brecha_cuidado   = wm(horas_cuidado[mujer == 1], peso[mujer == 1]) -
+                               wm(horas_cuidado[mujer == 0], peso[mujer == 0]),
+            .groups = "drop")
+geo_df <- res_dpto %>% left_join(caract_dpto, by = "cod_dpto") %>%
+  mutate(asim_propia_pp = -100 * theta2, w_prec = 1 / (100 * se_theta2)^2)
+f_det <- asim_propia_pp ~ ocup_fem + univ_fem + pct_cabecera + pct_estrato_bajo
+if (hay_k && all(!is.na(geo_df$brecha_cuidado))) f_det <- update(f_det, . ~ . + brecha_cuidado)
+m_det <- feols(f_det, data = geo_df, weights = ~ w_prec, vcov = "hetero")
+etq_det <- c("(Intercept)" = "Constante", ocup_fem = "Ocupación femenina (%)",
+             univ_fem = "Mujeres universitarias (%)", pct_cabecera = "Población en cabecera (%)",
+             pct_estrato_bajo = "Estrato 1-2 (%)", brecha_cuidado = "Brecha de horas de cuidado (M - H)")
+ct_det <- coeftable(m_det)
+tabla_det_geo <- tibble(Variable = unname(etq_det[rownames(ct_det)]),
+                        Coeficiente = ct_det[, 1], EE = ct_det[, 2], `p-valor` = ct_det[, 4])
+print(tabla_det_geo)
+
+# Pruebas resumidas (Tabla A10)
+pruebas_geo <- tibble(
+  Prueba = c("Departamentos con estimación",
+             "Wald: theta2 igual en todos los departamentos (F)",
+             "Wald: p-valor",
+             "Desviación estándar de la asimetría verdadera entre departamentos (tau, p.p.)",
+             "Media ponderada de theta2 (p.p.)",
+             "I de Moran de la asimetría (vecinos por st_touches)",
+             "I de Moran: p-valor por permutación (999)",
+             "R² de la regresión entre departamentos"),
+  Valor = c(nrow(res_dpto), w_geo$stat, w_geo$p, 100 * sqrt(eb_t2$tau2), 100 * eb_t2$mu,
+            I_obs, p_moran, r2(m_det, "r2")))
+print(pruebas_geo)
+
+tabla_dpto_export <- res_dpto %>%
+  arrange(desc(asim_eb)) %>%
+  transmute(Departamento = nombre, N = n,
+            `θ₂ propio (p.p.)` = 100 * theta2, `EE (p.p.)` = 100 * se_theta2,
+            `Asimetría bayes empírico (p.p.)` = asim_pp, `Peso propio (λ)` = lambda,
+            `Caída por hijo en mujeres (p.p.)` = caida_mujeres_pp,
+            `Cuadrante de Moran` = as.character(lisa),
+            `Solo capital` = ifelse(solo_capital, "Sí", ""))
+print(tabla_dpto_export, n = Inf)
+
+
+# ==============================================================================
+# 9. GRÁFICAS (autocontenidas: título, ejes, unidades, leyenda y fuente)
+# ==============================================================================
+# G1. Universitaria por condición conyugal y sexo, con IC 95 %
+g1_data <- d %>% group_by(ec, sexo) %>% resumir_prop(univ)
+grafico_1 <- ggplot(g1_data, aes(prop, ec, color = sexo)) +
+  geom_errorbar(aes(xmin = lo, xmax = hi), width = 0.2, orientation = "y") +
+  geom_point(size = 3.5) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_color_manual(values = col_g) +
+  labs(title = "Gráfica 1. Educación universitaria por condición conyugal y sexo",
+       x = "Proporción con universitaria o posgrado (IC 95 %)", y = NULL,
+       color = "Sexo", caption = fuente) + tema
+
+# G2. Universitaria por grupo de edad y sexo (composición por cohortes)
+g2_data <- d %>% group_by(edad_grp, sexo) %>% resumir_prop(univ)
+grafico_2 <- ggplot(g2_data, aes(edad_grp, prop, fill = sexo)) +
+  geom_col(position = position_dodge(.8), width = .7) +
+  geom_errorbar(aes(ymin = lo, ymax = hi), position = position_dodge(.8), width = .2) +
+  geom_text(aes(label = percent(prop, accuracy = 1)), position = position_dodge(.8),
+            vjust = -1.2, size = 3.3) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), expand = expansion(c(0, .1))) +
+  scale_fill_manual(values = col_g) +
+  labs(title = "Gráfica 2. Educación universitaria por grupo de edad y sexo",
+       x = "Grupo de edad (años)", y = "Proporción con universitaria o posgrado",
+       fill = "Sexo", caption = fuente) + tema
+
+# G3. Universitaria por número de hijos menores, sexo y edad
+g3_data <- d %>% group_by(edad_grp, hijos_cat, sexo) %>% resumir_prop(univ)
+grafico_3 <- ggplot(g3_data, aes(hijos_cat, prop, color = sexo, group = sexo)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi, fill = sexo), alpha = .15, color = NA) +
+  geom_line(linewidth = 1.1) + geom_point(size = 2.5) +
+  facet_wrap(~ edad_grp, labeller = labeller(edad_grp = function(x) paste(x, "años"))) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_color_manual(values = col_g) + scale_fill_manual(values = col_g, guide = "none") +
+  labs(title = "Gráfica 3. Hijos menores de 18 y educación universitaria, por sexo y edad",
+       x = "Hijos menores de 18 en el hogar", y = "Proporción con universitaria o posgrado",
+       color = "Sexo", caption = fuente) + tema
+
+# G4. Pendiente de los hijos por sexo y estrato
+grafico_4 <- ggplot(pendientes, aes(estrato_grp, est, color = sexo)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_pointrange(aes(ymin = lo, ymax = hi), position = position_dodge(.5)) +
+  scale_y_continuous(labels = function(x) paste0(round(100 * x, 1), " p.p.")) +
+  scale_color_manual(values = col_g) +
+  labs(title = "Gráfica 4. Asociación de un hijo adicional con el logro universitario",
+       subtitle = "Coeficiente de hijos menores de 18 por sexo y estrato (MPL con edad y efectos fijos, IC 95 %)",
+       x = "Estrato de la vivienda", y = "Cambio en la probabilidad de ser universitario(a)",
+       color = "Sexo", caption = fuente) + tema
+
+# GA1. Distribución del ingreso laboral (ocupados con ingreso positivo) -> anexo
+grafico_a1 <- ggplot(d %>% filter(ingreso_millones > 0),
+                     aes(ingreso_millones, fill = sexo, weight = peso)) +
+  geom_density(alpha = .5) +
+  scale_x_log10(labels = label_number(accuracy = .1)) +
+  scale_fill_manual(values = col_g) +
+  labs(title = "Gráfica A1. Distribución del ingreso laboral mensual por sexo (ocupados)",
+       x = "Ingreso laboral (millones COP, escala log)", y = "Densidad",
+       fill = "Sexo", caption = fuente) + tema
+
+graficos <- list("G1_brecha_estado_civil" = grafico_1, "G2_logro_por_edad" = grafico_2,
+                 "G3_hijos_logro_edad" = grafico_3, "G4_pendiente_hijos_estrato" = grafico_4,
+                 "GA1_ingreso" = grafico_a1)
+for (nm in names(graficos)) {
+  ggsave(file.path(ruta_resultados, paste0(nm, ".png")), graficos[[nm]],
+         width = ifelse(nm == "G3_hijos_logro_edad", 10, 8), height = 5.5, dpi = 300, bg = "white")
+}
+
+# ==============================================================================
+# 10. EXPORTACIÓN: WORD Y EXCEL
+# ==============================================================================
+formato <- function(df, titulo, decimales = 2, nota = NULL) {
+  num <- names(df)[sapply(df, is.numeric)]
+  ft <- flextable(df) %>%
+    colformat_double(j = num, digits = decimales, big.mark = ".", decimal.mark = ",") %>%
+    theme_booktabs() %>% set_caption(titulo) %>%
+    fontsize(size = 9, part = "all") %>% font(fontname = "Times New Roman", part = "all") %>%
+    bold(part = "header") %>% align(align = "center", part = "header") %>% autofit()
+  if (!is.null(nota)) ft <- add_footer_lines(ft, nota)
+  ft
+}
+fuente_tabla <- "Fuente: GEIH-DANE 2023-2025. Cálculos propios con FEX_C18/36."
+
+tablas_word <- list(
+  formato(tabla_1, "Tabla 1. Estadísticas descriptivas ponderadas por sexo", 2, fuente_tabla),
+  formato(efecto_mujeres, "Tabla 3b. Asociación de un hijo adicional por sexo (theta1 y theta1 + theta2)", 4, fuente_tabla),
+  formato(tabla_depuracion, "Tabla A1. Depuración de la muestra", 1, fuente_tabla),
+  formato(obs_anio_mes, "Tabla A2. Observaciones por año y mes", 0, fuente_tabla),
+  formato(tabla_emparejamiento, "Tabla A3. Emparejamiento educativo de cabeza de hogar y cónyuge", 2, fuente_tabla),
+  formato(tabla_continuas, "Tabla A3b. Estadísticas ponderadas de variables continuas por sexo", 2, fuente_tabla),
+  formato(tabla_ingreso, "Tabla A6. Situación de ingreso laboral por sexo", 2, fuente_tabla),
+  formato(tabla_ame, "Tabla A5b. Efecto marginal promedio (logit) de un hijo adicional", 4, fuente_tabla),
+  formato(tabla_robustez, "Tabla A5. Robustez del modelo central (parámetros clave)", 4, fuente_tabla),
+  formato(tabla_jefas, "Tabla A7. Logro universitario: jefas sin cónyuge vs. madres en pareja", 1, fuente_tabla),
+  formato(brecha_estrato, "Tabla A8. Pendiente de los hijos por sexo y estrato", 4, fuente_tabla),
+  formato(tabla_dpto_export, "Tabla A9. Asimetría por departamento (MPL M2 en cada departamento, bayes empírico)", 4,
+          paste(fuente_tabla, "En Arauca, Casanare, Putumayo, Amazonas, Guainía, Guaviare, Vaupés y Vichada la GEIH solo cubre la capital.")),
+  formato(pruebas_geo, "Tabla A10. Pruebas de heterogeneidad y autocorrelación espacial", 4, fuente_tabla),
+  formato(tabla_det_geo, "Tabla 4. Características departamentales asociadas a la asimetría (regresión entre departamentos)", 4,
+          paste(fuente_tabla, "MCO ponderado por la precisión de cada estimación (1/EE²), errores robustos."))
+)
+doc <- read_docx()
+for (ft in tablas_word) doc <- doc %>% body_add_flextable(ft) %>% body_add_par("", style = "Normal")
+print(doc, target = file.path(ruta_resultados, "Tablas_entrega_final.docx"))
+
+write.xlsx(list("Tabla1" = tabla_1, "Efecto_hijos" = efecto_mujeres,
+                "Depuracion" = tabla_depuracion, "Obs_anio_mes" = obs_anio_mes,
+                "Emparejamiento" = tabla_emparejamiento, "Continuas" = tabla_continuas,
+                "Ingreso_casos" = tabla_ingreso, "AME_logit" = tabla_ame,
+                "Pendientes_estrato" = pendientes, "Robustez" = tabla_robustez,
+                "Jefas" = tabla_jefas, "Brecha_estrato" = brecha_estrato,
+                "Departamentos" = tabla_dpto_export, "Pruebas_geo" = pruebas_geo,
+                "Determinantes_dpto" = tabla_det_geo),
+           file.path(ruta_resultados, "Tablas_entrega_final.xlsx"), overwrite = TRUE)
+
+etiquetas <- c("mujer" = "Mujer",
+               "n_hijos_18" = "Hijos menores de 18 (theta1)",
+               "mujer:n_hijos_18" = "Mujer x Hijos (theta2)",
+               "ecUnión libre" = "Unión libre", "ecCasado(a)" = "Casado(a)",
+               "ecSeparado(a)/Viudo(a)" = "Separado(a)/Viudo(a)",
+               "mujer:ecUnión libre" = "Mujer x Unión libre",
+               "mujer:ecCasado(a)" = "Mujer x Casado(a)",
+               "mujer:ecSeparado(a)/Viudo(a)" = "Mujer x Separado(a)/Viudo(a)",
+               "n_hijos_18:estrato_bajo" = "Hijos x Estrato bajo",
+               "mujer:n_hijos_18:estrato_bajo" = "Mujer x Hijos x Estrato bajo",
+               "horas_cuidado" = "Horas de cuidado de niños",
+               "ingreso_millones" = "Ingreso laboral (millones)")
+
+modelsummary(c(modelos, list("Heterogeneidad estrato" = m_het)),
+             coef_map = etiquetas, stars = TRUE, gof_map = c("nobs", "r.squared"),
+             title = "Tabla A4. MPL: probabilidad de educación universitaria o posgrado (errores agrupados por hogar)",
+             notes = "Base: hombre soltero. M2-M4 incluyen edad, edad al cuadrado y efectos fijos de año, departamento y zona; M3-M4 incluyen estrato.",
+             output = file.path(ruta_resultados, "Modelos_MPL.docx"))
+modelsummary(list("M2" = m2, "M2 ponderado" = m2_pond, "Con ingreso (ocupados)" = m_ingreso,
+                  "Logit (coef.)" = m2_logit),
+             coef_map = etiquetas, stars = TRUE, gof_map = c("nobs", "r.squared"),
+             title = "Tabla A5. Robustez del modelo central",
+             output = file.path(ruta_resultados, "Modelos_robustez.docx"))
+
+
+# Base analítica para el Rmd del reporte (reporte_analisis_geih.Rmd la lee con readRDS).
+# Guardarla junto al Rmd: aquí se asume que el Rmd está en ruta_base.
+saveRDS(list(d = d, res_dpto = res_dpto, tabla_depuracion = tabla_depuracion, obs_anio_mes = obs_anio_mes),
+        file.path(ruta_base, "datos_analiticos_geih.rds"))
+
+# ==============================================================================
+# 11. RESULTADOS AGREGADOS PARA LA SHINY APP
+# ==============================================================================
+# La app usa solo tablas agregadas (no microdatos): carga rápido y se puede
+# compartir. Las celdas guardan sumas de pesos para re-agregar con los filtros.
+celdas <- d %>%
+  group_by(sexo, ec, hijos_cat, edad_grp, estrato_grp) %>%
+  summarise(n = n(), sw = sum(peso), swy = sum(peso * univ), sw2 = sum(peso^2), .groups = "drop")
+
+coefs_app <- bind_rows(lapply(names(modelos), function(nm) {
+  ct <- coeftable(modelos[[nm]])
+  tibble(Modelo = nm, Variable = rownames(ct), Coef = ct[, 1], EE = ct[, 2])
+})) %>% filter(Variable %in% names(etiquetas)) %>%
+  mutate(Variable = etiquetas[Variable], lo = Coef - 1.96 * EE, hi = Coef + 1.96 * EE)
+
+app_datos <- list(celdas = celdas, tabla_1 = tabla_1, efecto = efecto_mujeres,
+                  coefs = coefs_app, pendientes = pendientes,
+                  emparejamiento = tabla_emparejamiento, depuracion = tabla_depuracion,
+                  n_muestra = nrow(d), pob = sum(d$peso),
+                  dpto = tabla_dpto_export, pruebas_geo = pruebas_geo, det_geo = tabla_det_geo,
+                  mapa = if (hay_shp) mapa_app else NULL, col_lisa = col_lisa)
+saveRDS(app_datos, file.path(ruta_resultados, "app_datos.rds"))
+cat("\nAnálisis listo. Archivos en:", ruta_resultados, "\n")
+
+# ==============================================================================
+# 12. SHINY APP
+# ==============================================================================
+# Puede correrse sola: basta con tener app_datos.rds en ruta_resultados.
+app_datos <- readRDS(file.path(ruta_resultados, "app_datos.rds"))
+fmt_pp <- function(x) paste0(formatC(100 * x, format = "f", digits = 2, decimal.mark = ","), " p.p.")
+ef_central <- app_datos$efecto %>% filter(Modelo == "M2 (central)")
+col_lisa   <- app_datos$col_lisa
+
+ui <- navbarPage(
+  title = "Hijos, género y educación universitaria (GEIH 2023-2025)",
+
+  tabPanel("Resumen",
+    fluidRow(column(10, offset = 1,
+      h3("¿Pesan más los hijos sobre el logro universitario de las mujeres?"),
+      p("Cabezas de hogar y cónyuges de 25 a 55 años. Muestra: ",
+        format(app_datos$n_muestra, big.mark = "."), " personas, que representan ",
+        round(app_datos$pob / 1e6, 1), " millones."),
+      h4("Resultado central (MPL con edad y efectos fijos)"),
+      tags$ul(
+        tags$li("Un hijo menor adicional se asocia con ", strong(fmt_pp(ef_central$`theta1 (hombres)`)),
+                " en la probabilidad de ser universitario en los hombres."),
+        tags$li("En las mujeres la asociación es ", strong(fmt_pp(ef_central$`theta1 + theta2 (mujeres)`)),
+                " (diferencia: ", fmt_pp(ef_central$`theta2 (Mujer x Hijos)`), ")."),
+        tags$li("Son asociaciones, no efectos causales: la fecundidad también responde a la educación.")),
+      h4("Tabla 1. Descriptivos ponderados por sexo"),
+      tableOutput("t1")))),
+
+  tabPanel("Explorar",
+    sidebarLayout(
+      sidebarPanel(
+        checkboxGroupInput("f_edad", "Grupo de edad", choices = c("25-34", "35-44", "45-55"),
+                           selected = c("25-34", "35-44", "45-55")),
+        checkboxGroupInput("f_estrato", "Estrato", choices = levels(app_datos$celdas$estrato_grp),
+                           selected = levels(app_datos$celdas$estrato_grp)),
+        checkboxGroupInput("f_ec", "Condición conyugal", choices = levels(app_datos$celdas$ec),
+                           selected = levels(app_datos$celdas$ec)),
+        radioButtons("f_x", "Eje horizontal", c("Hijos menores de 18" = "hijos_cat",
+                                                 "Condición conyugal" = "ec",
+                                                 "Grupo de edad" = "edad_grp",
+                                                 "Estrato" = "estrato_grp"))),
+      mainPanel(plotOutput("g_explorar", height = "450px"),
+                p("Proporciones ponderadas con IC 95 % (tamaño efectivo de Kish)."),
+                tableOutput("t_explorar")))),
+
+  tabPanel("Modelos",
+    fluidRow(column(10, offset = 1,
+      selectInput("f_mod", "Modelo", choices = unique(app_datos$coefs$Modelo), selected = "M2 (central)"),
+      plotOutput("g_coefs", height = "420px"),
+      h4("Asociación de un hijo adicional por sexo"), tableOutput("t_efecto"),
+      h4("Pendiente de los hijos por sexo y estrato"), plotOutput("g_pend", height = "380px")))),
+
+  tabPanel("Departamentos",
+    fluidRow(column(10, offset = 1,
+      h4("¿Dónde pesa más la crianza sobre el logro universitario de las mujeres?"),
+      p("Asimetría = caída adicional (p.p.) en la probabilidad de ser universitaria por cada hijo, ",
+        "mujeres frente a hombres (-theta2), estimada en cada departamento y corregida con bayes empírico."),
+      radioButtons("f_mapa", "Variable del mapa", inline = TRUE,
+                   c("Asimetría (-theta2)" = "asim_eb", "Pendiente en mujeres" = "mujeres_eb", "Clúster LISA" = "lisa")),
+      plotOutput("g_mapa", height = "560px"),
+      h5("Pruebas"), tableOutput("t_pruebas_geo"),
+      h5("Resultados por departamento"), tableOutput("t_dpto")))),
+
+  tabPanel("Parejas",
+    fluidRow(column(8, offset = 2,
+      h4("Emparejamiento educativo de cabeza de hogar y cónyuge"),
+      p("Porcentaje cuya pareja es universitaria, según el propio nivel. La última columna es la referencia si el emparejamiento fuera aleatorio."),
+      tableOutput("t_emp"))))
+)
+
+server <- function(input, output, session) {
+  output$t1 <- renderTable(app_datos$tabla_1, digits = 2, na = "")
+
+  datos_filtrados <- reactive({
+    req(input$f_edad, input$f_estrato, input$f_ec)
+    app_datos$celdas %>%
+      filter(edad_grp %in% input$f_edad, estrato_grp %in% input$f_estrato, ec %in% input$f_ec) %>%
+      group_by(x = .data[[input$f_x]], sexo) %>%
+      summarise(n = sum(n), prop = sum(swy) / sum(sw), neff = sum(sw)^2 / sum(sw2), .groups = "drop") %>%
+      mutate(se = sqrt(prop * (1 - prop) / neff), lo = prop - 1.96 * se, hi = prop + 1.96 * se)
+  })
+  output$g_explorar <- renderPlot({
+    ggplot(datos_filtrados(), aes(x, prop, color = sexo, group = sexo)) +
+      geom_line(linewidth = 1) + geom_pointrange(aes(ymin = lo, ymax = hi)) +
+      scale_y_continuous(labels = percent_format(accuracy = 1)) +
+      scale_color_manual(values = col_g) +
+      labs(title = "Proporción con educación universitaria o posgrado", x = NULL,
+           y = "Proporción", color = "Sexo", caption = fuente) + tema
+  })
+  output$t_explorar <- renderTable(
+    datos_filtrados() %>% transmute(Grupo = x, Sexo = sexo, N = n, `% universitaria` = 100 * prop),
+    digits = 1)
+
+  output$g_coefs <- renderPlot({
+    app_datos$coefs %>% filter(Modelo == input$f_mod) %>%
+      ggplot(aes(Coef, reorder(Variable, Coef))) +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+      geom_pointrange(aes(xmin = lo, xmax = hi), color = "#333333") +
+      scale_x_continuous(labels = function(x) paste0(round(100 * x, 1), " p.p.")) +
+      labs(title = paste("Coeficientes del", input$f_mod), x = "Cambio en la probabilidad (IC 95 %)",
+           y = NULL, caption = "Errores agrupados por hogar. Base: hombre soltero.") + tema
+  })
+  output$t_efecto <- renderTable(app_datos$efecto, digits = 4)
+  output$g_pend <- renderPlot({
+    ggplot(app_datos$pendientes, aes(estrato_grp, est, color = sexo)) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+      geom_pointrange(aes(ymin = lo, ymax = hi), position = position_dodge(.5)) +
+      scale_y_continuous(labels = function(x) paste0(round(100 * x, 1), " p.p.")) +
+      scale_color_manual(values = col_g) +
+      labs(x = "Estrato de la vivienda", y = "Cambio en la probabilidad (IC 95 %)",
+           color = "Sexo", caption = fuente) + tema
+  })
+  output$t_emp  <- renderTable(app_datos$emparejamiento, digits = 1)
+  output$t_pruebas_geo <- renderTable(app_datos$pruebas_geo, digits = 4)
+  output$t_dpto         <- renderTable(app_datos$dpto, digits = 2)
+  output$g_mapa <- renderPlot({
+    req(!is.null(app_datos$mapa))
+    mp <- app_datos$mapa
+    if (input$f_mapa == "lisa") {
+      ggplot(mp) + geom_sf(aes(fill = lisa), color = "white", linewidth = 0.2) +
+        scale_fill_manual(values = col_lisa, drop = FALSE) +
+        coord_sf(xlim = c(-79.2, -66.8), ylim = c(-4.3, 12.6)) +
+        labs(fill = "Clúster LISA", caption = fuente) + theme_void() + theme(legend.position = "right")
+    } else {
+      ggplot(mp) + geom_sf(aes(fill = 100 * .data[[input$f_mapa]]), color = "white", linewidth = 0.2) +
+        scale_fill_distiller(palette = "YlOrRd", direction = ifelse(input$f_mapa == "asim_eb", 1, -1)) +
+        coord_sf(xlim = c(-79.2, -66.8), ylim = c(-4.3, 12.6)) +
+        labs(fill = "p.p.", caption = fuente) + theme_void() + theme(legend.position = "right")
+    }
+  })
+}
+
+if (LANZAR_APP && interactive()) runApp(shinyApp(ui, server))
