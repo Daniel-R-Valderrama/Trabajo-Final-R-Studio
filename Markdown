@@ -21,7 +21,10 @@ output:
 #  - Se reemplaza "penalización" por "asociación" (el diseño MPL no es causal).
 #  - Conclusión por estrato corregida según la Gráfica 4.
 #  - Nueva sección 6: heterogeneidad por departamento y mapas (Clase 13).
-# Requiere datos_analiticos_geih.rds, que genera analisis_geih_final.R (v2).
+#  - Horas de cuidado (módulo K) = P3079S1 + P3082S1 (días × horas por día).
+#  - El shapefile de departamentos se busca dentro de "Base de Datos".
+# Requiere datos_analiticos_geih.rds, que genera analisis_geih_final.R (v2),
+# guardado en la carpeta "Trabajo Final" junto a este Rmd.
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
                       fig.width = 9, fig.height = 5.5, dpi = 200)
 library(dplyr); library(tidyr); library(ggplot2); library(scales)
@@ -52,7 +55,7 @@ fuente <- str_wrap(paste("Fuente: GEIH-DANE 2023–2025 (36 meses). Cabezas de h
 
 # Carga de datos y consolidación de la muestra
 
-Los microdatos corresponden a los 36 meses continuos de la Gran Encuesta Integrada de Hogares (GEIH 2023–2025) del DANE. Se consolidaron los módulos de Características generales, Ocupados, Datos del hogar y la vivienda (estrato) y Otras formas de trabajo (módulo K: horas semanales de cuidado no remunerado de niños y niñas).
+Los microdatos corresponden a los 36 meses continuos de la Gran Encuesta Integrada de Hogares (GEIH 2023–2025) del DANE. Se consolidaron los módulos de Características generales, Ocupados, Datos del hogar y la vivienda (estrato) y Otras formas de trabajo (módulo K: horas semanales sin pago dedicadas a cuidar niños menores de 5 años y a ayudar con tareas escolares, en el propio hogar; P3079S1 y P3082S1, días × horas por día). La GEIH no pregunta por el cuidado general de niños de 5 años o más, así que esta medida subestima esa carga.
 
 ```{r carga}
 datos_obj <- readRDS("datos_analiticos_geih.rds")
@@ -99,7 +102,7 @@ t1_largo <- d %>%
     `Ocupado(a) (%)`                                     = 100 * wm(ocupado, peso),
     `Horas trabajadas por semana (ocupados)`             = wm(horas_trabajo, peso),
     `Ingreso laboral mensual (millones COP, ingreso > 0)` = wm(ifelse(ingreso_millones > 0, ingreso_millones, NA), peso),
-    `Horas semanales de cuidado de niños (módulo K)`     = wm(horas_cuidado, peso),
+    `Horas semanales de cuidado de niños (< 5 años y tareas escolares, módulo K)` = wm(horas_cuidado, peso),
     `Estrato 1–2 (%)`                                    = 100 * wm(estrato_grp == niv_estrato[1], peso),
     .groups = "drop") %>%
   pivot_longer(-sexo, names_to = "Variable") %>%
@@ -401,10 +404,21 @@ ggplot(res_dpto, aes(y = reorder(nombre, -theta2_eb))) +
 ## Mapas
 
 ```{r geo-mapas, fig.height = 9}
-RUTA_SHP <- "MGN_DPTO_POLITICO"   # carpeta del shapefile de departamentos del DANE (MGN)
+# Shapefile de departamentos del DANE (MGN): se busca dentro de "Base de Datos"
+shp_candidatos <- list.files("Base de Datos", pattern = "\\.shp$", recursive = TRUE,
+                             full.names = TRUE, ignore.case = TRUE)
+RUTA_SHP <- shp_candidatos[grepl("DPTO", shp_candidatos, ignore.case = TRUE) &
+                           !grepl("MPIO", shp_candidatos, ignore.case = TRUE)][1]
 CAMPO_SHP <- "DPTO_CCDGO"         # campo con el código DIVIPOLA
-dptos_sf <- st_read(RUTA_SHP, quiet = TRUE) %>%
-  rename(cod_dpto = all_of(CAMPO_SHP)) %>%
+dptos_raw <- st_read(RUTA_SHP, quiet = TRUE)
+tab_shp <- st_drop_geometry(dptos_raw)
+campo_cod <- names(tab_shp)[toupper(names(tab_shp)) == toupper(CAMPO_SHP)]   # mayúsculas o minúsculas
+if (length(campo_cod) != 1)   # respaldo: la columna con códigos de departamento de 2 dígitos
+  campo_cod <- names(tab_shp)[vapply(tab_shp, function(v) {
+    v <- suppressWarnings(as.integer(as.character(v)))
+    all(!is.na(v)) && all(v >= 5 & v <= 99) && length(unique(v)) >= 30 }, logical(1))][1]
+dptos_sf <- dptos_raw %>%
+  rename(cod_dpto = all_of(campo_cod)) %>%
   mutate(cod_dpto = sprintf("%02d", as.integer(cod_dpto))) %>%
   select(cod_dpto) %>% st_make_valid() %>% st_transform(9377)
 mapa_dpto <- dptos_sf %>% left_join(res_dpto, by = "cod_dpto") %>% filter(!is.na(theta2))
