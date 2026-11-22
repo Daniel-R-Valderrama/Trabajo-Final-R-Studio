@@ -50,10 +50,16 @@ lincom <- function(mod, nombres) {
 fmt_p <- function(p) ifelse(p < 0.001, "< 0,001", formatC(p, format = "f", digits = 3, decimal.mark = ","))
 tema  <- theme_minimal(base_size = 12) +
   theme(legend.position = "bottom", plot.title = element_text(face = "bold"),
-        plot.caption = element_text(hjust = 0, size = 8), plot.title.position = "plot")
+        plot.caption = element_text(hjust = 0, size = 8), plot.title.position = "plot",
+        plot.caption.position = "plot", plot.margin = margin(10, 15, 10, 10))
 col_g <- c("Hombre" = "#1f77b4", "Mujer" = "#d62728")
 fuente <- str_wrap(paste("Fuente: GEIH-DANE 2023–2025 (36 meses). Cabezas de hogar y cónyuges de 25 a 55 años.",
                          "Cálculos propios con FEX_C18/36 (población promedio del periodo)."), 110)
+```
+
+```{css, echo = FALSE}
+.main-container { max-width: 1250px; }
+.table, table { display: block; max-width: 100%; overflow-x: auto; }
 ```
 
 # Carga de datos y consolidación de la muestra
@@ -310,7 +316,7 @@ ggplot(pendientes, aes(estrato_grp, est, color = sexo)) +
   geom_pointrange(aes(ymin = lo, ymax = hi), position = position_dodge(0.4), size = 0.8, linewidth = 1) +
   scale_y_continuous(labels = function(x) paste0(round(100 * x, 1), " p.p.")) +
   scale_color_manual(values = col_g) +
-  labs(title = "Gráfica 4. Asociación de un hijo adicional con el logro universitario, por estrato",
+  labs(title = "Gráfica 4. Asociación de un hijo adicional con el logro universitario,\npor estrato",
        subtitle = "Coeficiente de hijos menores de 18 con IC 95 % (MPL con edad y efectos fijos)",
        x = "Estrato de la vivienda", y = "Cambio en la probabilidad (p.p.)",
        color = "Sexo", caption = fuente) + tema
@@ -407,7 +413,7 @@ w_geo <- wald(m_geo, keep = "^cod_dpto::.*:mujer_hijos$", print = FALSE)
 
 La prueba de Wald de que θ₂ es igual en los `r nrow(res_dpto)` departamentos da F = `r round(w_geo$stat, 2)` (p = `r fmt_p(w_geo$p)`). La desviación estándar de la asimetría verdadera entre departamentos es τ = `r round(100 * sqrt(eb_t2$tau2), 2)` p.p., alrededor de una media de `r round(100 * eb_t2$mu, 2)` p.p.
 
-```{r g5, fig.height = 9}
+```{r g5, fig.width = 9.5, fig.height = 10}
 ggplot(res_dpto, aes(y = reorder(nombre, -theta2_eb))) +
   geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
   geom_vline(xintercept = eb_t2$mu, color = "#d62728", alpha = 0.5) +
@@ -416,13 +422,13 @@ ggplot(res_dpto, aes(y = reorder(nombre, -theta2_eb))) +
   geom_point(aes(x = theta2_eb), color = "#d62728", size = 2.6) +
   scale_x_continuous(labels = function(x) paste0(round(100 * x, 1), " p.p.")) +
   labs(title = "Gráfica 5. Asimetría de los hijos por departamento (Mujer × Hijos, θ₂)",
-       subtitle = "Gris: estimación del departamento con IC 95 %. Rojo: bayes empírico. Línea roja: media nacional",
+       subtitle = "Gris: estimación del departamento con IC 95 %. Rojo: bayes empírico.\nLínea roja: media nacional",
        x = "θ₂: caída adicional por hijo en mujeres frente a hombres (p.p.)", y = NULL, caption = fuente) + tema
 ```
 
 ## Mapas
 
-```{r geo-mapas, fig.height = 9}
+```{r geo-mapas, fig.width = 9.5, fig.height = 10}
 # Shapefile de departamentos del DANE (MGN): se busca dentro de "Base de Datos"
 shp_candidatos <- list.files("Base de Datos", pattern = "\\.shp$", recursive = TRUE,
                              full.names = TRUE, ignore.case = TRUE)
@@ -471,7 +477,9 @@ mapa_jenks <- function(datos, variable, titulo_leyenda, paleta) {
   datos$clase <- cut(x, breaks = cortes, include.lowest = TRUE, dig.lab = 3)
   ggplot(datos) + geom_sf(aes(fill = clase), color = "white", linewidth = 0.1) +
     scale_fill_brewer(palette = paleta, name = titulo_leyenda) + theme_void() +
-    theme(legend.position = "bottom", plot.title = element_text(face = "bold"), plot.caption = element_text(hjust = 0))
+    theme(legend.position = "bottom", plot.title = element_text(face = "bold"), plot.caption = element_text(hjust = 0),
+          plot.title.position = "plot", plot.caption.position = "plot", plot.margin = margin(10, 15, 10, 10)) +
+    guides(fill = guide_legend(title.position = "top", nrow = 2, byrow = TRUE))
 }
 nota_mapa <- paste(fuente, "\nLínea punteada: solo la capital. San Andrés no se dibuja.")
 mapa_jenks(mapa_plot, "asim_pp", "Caída adicional por hijo en mujeres (p.p.)", "YlOrRd") +
@@ -486,7 +494,9 @@ ggplot(mapa_plot) + geom_sf(aes(fill = lisa), color = "white", linewidth = 0.1) 
        subtitle = paste0("I de Moran = ", round(I_obs, 3), " (p por permutación = ", round(p_moran, 3), ")"),
        caption = nota_mapa) +
   theme_void() + theme(legend.position = "bottom", plot.title = element_text(face = "bold"),
-                       plot.caption = element_text(hjust = 0)) + guides(fill = guide_legend(nrow = 2))
+                       plot.caption = element_text(hjust = 0), plot.title.position = "plot",
+                       plot.caption.position = "plot", plot.margin = margin(10, 15, 10, 10)) +
+  guides(fill = guide_legend(nrow = 2))
 ```
 
 ### Mapa interactivo
