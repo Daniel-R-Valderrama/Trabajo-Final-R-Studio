@@ -182,7 +182,9 @@ lincom <- function(mod, nombres) {
 
 tema   <- theme_minimal(base_size = 12) +
   theme(legend.position = "bottom", plot.title = element_text(face = "bold"),
-        plot.caption = element_text(hjust = 0))
+        plot.caption = element_text(hjust = 0),
+        plot.title.position = "plot", plot.caption.position = "plot",
+        plot.margin = margin(10, 15, 10, 10))
 col_g  <- c("Hombre" = "#1f77b4", "Mujer" = "#d62728")
 fuente <- "Fuente: GEIH-DANE 2023-2025. Cabezas de hogar y cónyuges de 25 a 55 años. Cálculos propios con FEX_C18/36."
 
@@ -592,7 +594,7 @@ grafico_5 <- ggplot(res_dpto, aes(y = reorder(nombre, -theta2_eb))) +
   geom_point(aes(x = theta2_eb), color = "#d62728", size = 2.6) +
   scale_x_continuous(labels = function(x) paste0(round(100 * x, 1), " p.p.")) +
   labs(title = "Gráfica 5. Asimetría de los hijos por departamento (Mujer × Hijos, θ₂)",
-       subtitle = "Gris: estimación del departamento con IC 95 %. Rojo: bayes empírico. Línea roja: media nacional",
+       subtitle = "Gris: estimación del departamento con IC 95 %. Rojo: bayes empírico.\nLínea roja: media nacional",
        x = "θ₂: caída adicional por hijo en mujeres frente a hombres (p.p.)", y = NULL, caption = fuente) + tema
 ggsave(file.path(ruta_resultados, "G5_asimetria_departamentos.png"), grafico_5,
        width = 8, height = 9, dpi = 300, bg = "white")
@@ -688,7 +690,10 @@ if (hay_shp) {
       scale_fill_brewer(palette = paleta, name = titulo_leyenda) +
       theme_void() +
       theme(legend.position = "bottom", plot.title = element_text(face = "bold"),
-            plot.caption = element_text(hjust = 0))
+            plot.caption = element_text(hjust = 0),
+            plot.title.position = "plot", plot.caption.position = "plot",
+            plot.margin = margin(10, 15, 10, 10)) +
+      guides(fill = guide_legend(title.position = "top", nrow = 2, byrow = TRUE))
   }
   nota_mapa <- paste(fuente, "\nLínea punteada: departamentos donde la GEIH solo cubre la capital. San Andrés no se dibuja (ver Tabla A9).")
   top5 <- mapa_plot %>% arrange(desc(asim_pp)) %>% head(5)
@@ -882,7 +887,8 @@ formato <- function(df, titulo, decimales = 2, nota = NULL) {
     colformat_double(j = num, digits = decimales, big.mark = ".", decimal.mark = ",") %>%
     theme_booktabs() %>% set_caption(titulo) %>%
     fontsize(size = 9, part = "all") %>% font(fontname = "Times New Roman", part = "all") %>%
-    bold(part = "header") %>% align(align = "center", part = "header") %>% autofit()
+    bold(part = "header") %>% align(align = "center", part = "header") %>% autofit() %>%
+    fit_to_width(max_width = 6.3)   # ancho útil de la página A4 con márgenes de 2,5 cm
   if (!is.null(nota)) ft <- add_footer_lines(ft, nota)
   ft
 }
