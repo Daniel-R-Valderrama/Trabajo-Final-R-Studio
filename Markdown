@@ -23,6 +23,9 @@ output:
 #  - Nueva sección 6: heterogeneidad por departamento y mapas (Clase 13).
 #  - Horas de cuidado (módulo K) = P3079S1 + P3082S1 (días × horas por día).
 #  - El shapefile de departamentos se busca dentro de "Base de Datos".
+#  - Numeración de tablas igual a la del documento Word (Tabla 1 módulos, 2 descriptivos,
+#    3 MPL, 4 regresión entre departamentos). Textos con cifras calculadas en línea.
+#  - Mapa interactivo con tamaño fijo y centrado en Colombia.
 # Requiere datos_analiticos_geih.rds, que genera analisis_geih_final.R (v2),
 # guardado en la carpeta "Trabajo Final" junto a este Rmd.
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
@@ -57,6 +60,16 @@ fuente <- str_wrap(paste("Fuente: GEIH-DANE 2023–2025 (36 meses). Cabezas de h
 
 Los microdatos corresponden a los 36 meses continuos de la Gran Encuesta Integrada de Hogares (GEIH 2023–2025) del DANE. Se consolidaron los módulos de Características generales, Ocupados, Datos del hogar y la vivienda (estrato) y Otras formas de trabajo (módulo K: horas semanales sin pago dedicadas a cuidar niños menores de 5 años y a ayudar con tareas escolares, en el propio hogar; P3079S1 y P3082S1, días × horas por día). La GEIH no pregunta por el cuidado general de niños de 5 años o más, así que esta medida subestima esa carga.
 
+**Tabla 1. Módulos de la GEIH y variables utilizadas**
+
+| Módulo | Variables | Uso |
+|---|---|---|
+| Características generales, salud y educación | Sexo (P3271), edad (P6040), parentesco (P6050), estado civil (P6070), nivel educativo (P3042), departamento (DPTO), FEX_C18 | Resultado, explicativas, departamento y factor de expansión |
+| Ocupados | Ingreso laboral (INGLABO), horas trabajadas (P6800) | Descriptivos laborales y robustez |
+| Datos del hogar y la vivienda | Estrato de la vivienda (P4030S1A1) | Condición socioeconómica |
+| Otras formas de trabajo (módulo K) | Cuidar niñas o niños menores de 5 años (P3079S1) y ayudar con tareas o trabajos escolares (P3082S1), días × horas por día | Medir directamente la carga de cuidado |
+| MGN-DANE (shapefile de departamentos) | Polígonos y código DIVIPOLA (DPTO_CCDGO) | Mapas y vecindad entre departamentos |
+
 ```{r carga}
 datos_obj <- readRDS("datos_analiticos_geih.rds")
 d <- datos_obj$d
@@ -85,7 +98,7 @@ kable(obs_anio_mes, format.args = list(big.mark = "."),
 
 # Estadísticas descriptivas
 
-## Tabla 1. Estadísticas descriptivas ponderadas por sexo
+## Tabla 2. Estadísticas descriptivas ponderadas por sexo
 
 ```{r tabla-1}
 niv_ec <- c("Soltero(a)", "Unión libre", "Casado(a)", "Separado(a)/Viudo(a)")
@@ -116,14 +129,17 @@ tabla_1 <- bind_rows(tabla_1, tibble(
   Mujeres = format(n_sexo$n[n_sexo$sexo == "Mujer"], big.mark = "."),
   Hombres = format(n_sexo$n[n_sexo$sexo == "Hombre"], big.mark = "."),
   `Diferencia (M − H)` = ""))
+hc <- d %>% group_by(sexo) %>% summarise(h = wm(horas_cuidado, peso))   # para el texto
+h_muj <- hc$h[hc$sexo == "Mujer"]; h_hom <- hc$h[hc$sexo == "Hombre"]
+fmt1 <- function(x) formatC(x, format = "f", digits = 1, decimal.mark = ",")
 kable(tabla_1, align = "lrrr",
-      caption = "Tabla 1. Estadísticas descriptivas ponderadas por sexo (GEIH 2023–2025)")
+      caption = "Tabla 2. Estadísticas descriptivas ponderadas por sexo (GEIH 2023–2025)")
 ```
 
-**Hallazgos de la Tabla 1.**
+**Hallazgos de la Tabla 2.**
 
 - **Mayor logro educativo en las mujeres:** 20,6 % de las mujeres tiene educación universitaria o de posgrado, frente a 18,8 % de los hombres (+1,7 p.p.).
-- **Brechas en el mercado laboral y en el uso del tiempo:** a pesar de su mayor educación, las mujeres están mucho menos ocupadas (61,9 % frente a 92,0 %) y dedican 9,4 horas semanales al cuidado no remunerado de niños, frente a 2,6 horas de los hombres (3,7 veces más).
+- **Brechas en el mercado laboral y en el uso del tiempo:** a pesar de su mayor educación, las mujeres están mucho menos ocupadas (61,9 % frente a 92,0 %) y dedican `r fmt1(h_muj)` horas semanales al cuidado no remunerado de niños menores de 5 años y a ayudar con tareas escolares, frente a `r fmt1(h_hom)` horas de los hombres (`r fmt1(h_muj / h_hom)` veces más).
 - **Jefatura femenina sin cónyuge:** 18,5 % de las mujeres son cabezas de hogar sin cónyuge con hijos menores, frente a 2,5 % de los hombres.
 
 ## Tabla A3. Emparejamiento educativo
@@ -235,7 +251,7 @@ m4 <- feols(univ ~ mujer * ec + mujer * n_hijos_18 + edad + edad2 + estrato_grp 
 modelos <- list("M1" = m1, "M2 (central)" = m2, "M3" = m3, "M4" = m4)
 ```
 
-## Tabla 2. Resumen de los MPL (M1 a M4)
+## Tabla 3. Resumen de los MPL (M1 a M4)
 
 ```{r tabla-2}
 f4 <- function(x) formatC(unname(x), digits = 4, format = "f")
@@ -256,10 +272,10 @@ filas <- lapply(names(modelos), function(nm) {
 tabla_2 <- data.frame(Variable = names(filas[[1]]), do.call(cbind, lapply(filas, unname)),
                       check.names = FALSE)
 colnames(tabla_2)[-1] <- names(modelos)
-kable(tabla_2, align = "lrrrr", caption = "Tabla 2. Probabilidad de tener educación universitaria o de posgrado (MPL)")
+kable(tabla_2, align = "lrrrr", caption = "Tabla 3. Probabilidad de tener educación universitaria o de posgrado (MPL)")
 ```
 
-## Tabla 2b. Asociación de un hijo adicional por sexo
+## Tabla 3b. Asociación de un hijo adicional por sexo
 
 ```{r tabla-2b}
 efecto <- bind_rows(lapply(names(modelos), function(nm) {
@@ -269,10 +285,13 @@ efecto <- bind_rows(lapply(names(modelos), function(nm) {
          `θ₂ (Mujer × Hijos)` = ct[[1]], `p-valor θ₂` = fmt_p(ct[[4]]),
          `θ₁ + θ₂ (mujeres)` = r[["est"]], `EE (mujeres)` = r[["se"]], `p-valor (mujeres)` = fmt_p(r[["p"]]))
 }))
-kable(efecto, digits = 4, caption = "Tabla 2b. Asociación de un hijo adicional con el logro universitario, por sexo")
+pp <- function(x) formatC(100 * x, format = "f", digits = 2, decimal.mark = ",")
+t2_m3 <- coef(m3)[["mujer:n_hijos_18"]]; t2_m4 <- coef(m4)[["mujer:n_hijos_18"]]
+b_horas <- coef(m4)[["horas_cuidado"]]
+kable(efecto, digits = 4, caption = "Tabla 3b. Asociación de un hijo adicional con el logro universitario, por sexo")
 ```
 
-**Lectura.** En el modelo central (M2), un hijo adicional se asocia con −3,0 p.p. de probabilidad de ser universitario en los hombres y con −4,5 p.p. en las mujeres (θ₂ = −1,5 p.p.): la asociación es 1,5 veces más fuerte en ellas. Al pasar de M1 a M2, Mujer × Casado(a) casi no cambia (2,3 → 2,1 p.p.), mientras que al añadir el estrato (M3) cae a la mitad (1,1 p.p.). Al añadir las horas de cuidado (M4), θ₂ no se reduce (−1,24 → −1,30 p.p.): la asimetría no se explica por el tiempo de cuidado actual.
+**Lectura.** En el modelo central (M2), un hijo adicional se asocia con −3,0 p.p. de probabilidad de ser universitario en los hombres y con −4,5 p.p. en las mujeres (θ₂ = −1,5 p.p.): la asociación es 1,5 veces más fuerte en ellas. Al pasar de M1 a M2, Mujer × Casado(a) casi no cambia (2,3 → 2,1 p.p.), mientras que al añadir el estrato (M3) cae a la mitad (1,1 p.p.). Al añadir las horas de cuidado (M4), θ₂ no se reduce (`r pp(t2_m3)` → `r pp(t2_m4)` p.p.): la asimetría no se explica por el tiempo de cuidado actual. El coeficiente de las horas de cuidado es pequeño y positivo (`r formatC(100 * b_horas, format = "f", digits = 3, decimal.mark = ",")` p.p. por hora): a igual número de hijos, quienes dedican más horas, sobre todo a ayudar con tareas escolares, tienden a tener más educación.
 
 # Heterogeneidad socioeconómica
 
@@ -472,13 +491,14 @@ ggplot(mapa_plot) + geom_sf(aes(fill = lisa), color = "white", linewidth = 0.1) 
 
 ### Mapa interactivo
 
-```{r geo-leaflet}
+```{r geo-leaflet, out.width = "100%"}
 mapa_wgs <- st_transform(mapa_plot, 4326)   # leaflet solo entiende WGS84
 cortes_l <- tryCatch(unique(getJenksBreaks(mapa_wgs$asim_pp, 6)), error = function(e) NULL)
 if (length(cortes_l) < 3) cortes_l <- unique(quantile(mapa_wgs$asim_pp, 0:4 / 4))
 paleta <- colorBin("YlOrRd", domain = mapa_wgs$asim_pp, bins = cortes_l)
-leaflet() %>%
+leaflet(width = "100%", height = 550) %>%
   addProviderTiles(providers$Esri.WorldStreetMap) %>%
+  fitBounds(lng1 = -79.0, lat1 = -4.3, lng2 = -66.8, lat2 = 12.6) %>%   # Colombia continental
   addPolygons(data = mapa_wgs, fillColor = ~paleta(asim_pp), fillOpacity = 0.75, color = "white", weight = 1,
               label = ~nombre,
               popup = ~paste0("<b>", nombre, "</b><br>Asimetría: ", round(asim_pp, 2), " p.p.<br>",
@@ -503,11 +523,11 @@ geo_df <- res_dpto %>% left_join(caract_dpto, by = "cod_dpto") %>%
   mutate(asim_propia_pp = -100 * theta2, w_prec = 1 / (100 * se_theta2)^2)
 m_det <- feols(asim_propia_pp ~ ocup_fem + univ_fem + pct_cabecera + pct_estrato_bajo + brecha_cuidado,
                data = geo_df, weights = ~ w_prec, vcov = "hetero")
-modelsummary(list("Asimetría (p.p.)" = m_det), stars = TRUE, gof_map = c("nobs", "r.squared"),
+modelsummary(list("Asimetría (p.p.)" = m_det), stars = TRUE, gof_map = c("nobs", "r.squared"), fmt = 4,
              coef_rename = c(ocup_fem = "Ocupación femenina (%)", univ_fem = "Mujeres universitarias (%)",
                              pct_cabecera = "Población en cabecera (%)", pct_estrato_bajo = "Estrato 1-2 (%)",
                              brecha_cuidado = "Brecha de horas de cuidado (M − H)", "(Intercept)" = "Constante"),
-             title = "Tabla 3. Características departamentales asociadas a la asimetría (MCO ponderado por 1/EE², errores robustos)")
+             title = "Tabla 4. Características departamentales asociadas a la asimetría (MCO ponderado por 1/EE², errores robustos)")
 res_dpto %>% arrange(desc(asim_pp)) %>%
   transmute(Departamento = nombre, N = format(n, big.mark = "."), `θ₂ propio (p.p.)` = 100 * theta2,
             `EE (p.p.)` = 100 * se_theta2, `Asimetría bayes empírico (p.p.)` = asim_pp, `λ` = lambda,
@@ -515,12 +535,22 @@ res_dpto %>% arrange(desc(asim_pp)) %>%
   kable(digits = 2, caption = "Tabla A9. Asimetría por departamento")
 ```
 
+```{r geo-texto, include = FALSE}
+ct_det <- coeftable(m_det)
+pv <- function(v) fmt_p(ct_det[v, 4])
+f3 <- function(x) formatC(x, format = "f", digits = 3, decimal.mark = ",")
+top3 <- res_dpto %>% arrange(desc(asim_pp)) %>% head(3)
+bot3 <- res_dpto %>% arrange(asim_pp) %>% head(3)
+```
+
+**Resultados.** Tras la corrección por bayes empírico, la asimetría es mayor en `r paste(top3$nombre, collapse = ", ")` y menor en `r paste(bot3$nombre, collapse = ", ")` (Gráficas 5 y 6). La I de Moran es `r f3(I_obs)` (p = `r f3(p_moran)`): los departamentos con alta asimetría se agrupan regionalmente, con un bloque alto en las regiones Andina, Pacífica y de la Orinoquía y un bloque bajo en el Caribe (Gráfica 7). En la regresión entre departamentos (Tabla 4), la asimetría es menor donde hay más población en las cabeceras (p = `r pv("pct_cabecera")`) y donde hay más estrato 1–2 (p = `r pv("pct_estrato_bajo")`), y mayor, aunque con menor precisión, donde hay más mujeres universitarias (p = `r pv("univ_fem")`); ni la ocupación femenina ni la brecha de horas de cuidado muestran una relación significativa.
+
 **Cómo leer esta sección.** Si la prueba de Wald rechaza y τ es grande frente a la media, la asimetría está diferenciada localmente; el mapa muestra dónde, la I de Moran dice si los departamentos con alta asimetría se agrupan (regiones) o están dispersos, y la regresión entre departamentos indica qué características locales la acompañan. Con 33 departamentos estas relaciones son descriptivas.
 
 # Conclusiones
 
 - **Asociación asimétrica:** un hijo menor adicional se asocia con −4,5 p.p. de probabilidad de ser universitaria en las mujeres y −3,0 p.p. en los hombres (θ₂ = −1,5 p.p., M2); el logit confirma el patrón.
 - **Edad y estrato:** la ventaja femenina es generacional, y el diferencial por matrimonio se explica en buena parte por el estrato, no por la edad.
-- **Cuidado:** las mujeres dedican 3,7 veces más horas al cuidado de niños, pero controlar por esas horas no reduce la asimetría.
+- **Cuidado:** las mujeres dedican `r fmt1(h_muj / h_hom)` veces más horas al cuidado de niños menores de 5 años y a tareas escolares, pero controlar por esas horas no reduce la asimetría. El módulo K no capta otras formas de cuidado de hijos mayores, así que la medida subestima esa carga.
 - **Estrato:** la asimetría está en todos los estratos y se atenúa en 4–6.
-- **Territorio:** la sección 6 muestra si la asimetría está diferenciada por departamento, dónde es mayor y si se agrupa regionalmente (Gráficas 5–7, Tabla 3).
+- **Territorio:** la asimetría no es uniforme: se concentra en las regiones Pacífica (Chocó, Cauca, Nariño), Andina (Boyacá, Caldas) y la Orinoquía, y es baja en el Caribe. Es menor en los departamentos más urbanizados, lo que sugiere focalizar las políticas de cuidado en los menos urbanizados (Gráficas 5–7, Tabla 4).
